@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher icon: the HX logo provided by the project's author (branding/logo/hx_logo_source.jpg). -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:drawable="@drawable/ic_hx_logo_bg" />
+    <item android:drawable="@drawable/ic_hx_logo_fg" />
+</layer-list>

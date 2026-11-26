@@ -1,0 +1,220 @@
+package com.hyperxr.mixedreality
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
+import android.media.Image
+import android.media.ImageReader
+import android.opengl.Matrix
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.SystemClock
+import android.util.Range
+import android.util.Size
+import android.view.Surface
+import com.hyperxr.diagnostics.Diagnostics
+import com.hyperxr.diagnostics.Stage
+import com.hyperxr.handtracking.CameraIntrinsics
+import com.hyperxr.rendering.CameraImageSource
+import com.hyperxr.rendering.Gl
+import kotlin.math.atan
+
+/**
+ * Video see-through with Camera2 when ARCore is not available: one stream to a SurfaceTexture
+ * (displayed as the MR background) and one small YUV stream for hand tracking. This is a mono
+ * camera feed with 3DoF head tracking; latency is measured from the sensor timestamp.
+ */
+class CameraPassthrough(private val context: Context) : CameraImageSource {
+    override var textureId = 0; private set
+    override val texMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    override var fovX = 1.1f; private set
+    override var fovY = 0.85f; private set
+    override var imageAspect = 16f / 9f; private set
+    override val regionTanX: Float get() = kotlin.math.tan(fovX / 2)
+    override val regionTanY: Float get() = kotlin.math.tan(fovY / 2)
+    @Volatile override var hasFrame = false; private set
+    /**
+     * View UV -> CPU (hand tracking) image UV. Both streams are centred crops of the sensor: the
+     * wider one covers the full width, the other a central band; upside-down landscape flips.
+     */
+    override val cpuMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private var cpuAspect = 4f / 3f
+
+    private fun updateCpuMatrix() {
+        Matrix.setIdentityM(cpuMatrix, 0)
+        var sx = 1f; var sy = 1f
+        if (imageAspect > cpuAspect) sy = cpuAspect / imageAspect else sx = imageAspect / cpuAspect
+        val flip = displayRotation == Surface.ROTATION_270
+        val f = if (flip) -1f else 1f
+        cpuMatrix[0] = sx * f; cpuMatrix[5] = sy * f
+        cpuMatrix[12] = 0.5f - 0.5f * sx * f; cpuMatrix[13] = 0.5f - 0.5f * sy * f
+    }
+
+    var error: String? = null; private set
+    var intrinsics: CameraIntrinsics? = null; private set
+    private val stTransform = FloatArray(16)
+    /** Display rotation of the activity (Surface.ROTATION_*), set by the engine before [start]. */
+    @Volatile var displayRotation = Surface.ROTATION_90
+    private val displayToNatural = FloatArray(16)
+    private val tmpM = FloatArray(16)
+    private var surfaceTexture: SurfaceTexture? = null
+    private var surface: Surface? = null
+    private var reader: ImageReader? = null
+    private var device: CameraDevice? = null
+    private var session: CameraCaptureSession? = null
+    private val thread = HandlerThread("hx-camera").apply { start() }
+    private val handler = Handler(thread.looper)
+    @Volatile private var frameAvailable = false
+    private var realtimeTimestamps = false
+
+    /** Receives YUV frames for hand tracking (on the camera thread). Must close the image. */
+    var onCpuFrame: ((Image, CameraIntrinsics) -> Unit)? = null
+
+    /** GL thread: create the OES texture, then open the camera. */
+    @SuppressLint("MissingPermission")
+    fun start(cpuSize: Size = Size(640, 480)) {
+        textureId = Gl.externalTexture()
+        val cm = context.getSystemService(CameraManager::class.java)
+        val id = cm.cameraIdList.firstOrNull {
+            cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraMetadata.LENS_FACING_BACK
+        } ?: run { error = "No back camera"; return }
+        val ch = cm.getCameraCharacteristics(id)
+        realtimeTimestamps = ch.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
+        val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+        // Prefer the steadiest range reaching 60 fps (lower camera-to-photon latency), else the fastest one.
+        val ranges = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES).orEmpty()
+        val fpsRange = ranges.filter { it.upper >= 60 }.maxByOrNull { it.lower } ?: ranges.maxByOrNull { it.upper * 1000 + it.lower } ?: Range(30, 30)
+        // Video mode at the phone's best: the largest picture the camera delivers at that frame
+        // rate (4K60 where the phone records 4K60), widescreen first. If the phone refuses it
+        // together with the small hand-tracking stream, the next size down is tried.
+        val maxFrameNs = (1_000_000_000L / fpsRange.upper) * 102 / 100
+        sizes = map.getOutputSizes(SurfaceTexture::class.java)
+            .filter { it.width * 9 == it.height * 16 || it.width * 3 == it.height * 4 }
+            .filter { sz -> runCatching { map.getOutputMinFrameDuration(SurfaceTexture::class.java, sz) }.getOrDefault(0L).let { it == 0L || it <= maxFrameNs } }
+            .sortedWith(compareBy({ -(it.width * it.height) }, { if (it.width * 9 == it.height * 16) 0 else 1 }))
+            .ifEmpty { listOf(Size(1280, 720)) }
+        val previewSize = sizes.first()
+        imageAspect = previewSize.width.toFloat() / previewSize.height
+        val cpu = map.getOutputSizes(ImageFormat.YUV_420_888).minByOrNull { kotlin.math.abs(it.width - cpuSize.width) + kotlin.math.abs(it.height - cpuSize.height) } ?: cpuSize
+        cpuAspect = cpu.width.toFloat() / cpu.height
+
+        // field of view from the physical sensor size and focal length
+        val sensor = ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+        val focal = ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull()
+        if (sensor != null && focal != null) {
+            val aspect = previewSize.width.toFloat() / previewSize.height
+            fovX = 2f * atan(sensor.width / (2f * focal))
+            fovY = 2f * atan((sensor.width / aspect) / (2f * focal))
+            val fxPx = cpu.width * focal / sensor.width
+            intrinsics = CameraIntrinsics(fxPx, fxPx, cpu.width / 2f, cpu.height / 2f, cpu.width, cpu.height)
+        }
+
+        surfaceTexture = SurfaceTexture(textureId).apply {
+            setDefaultBufferSize(previewSize.width, previewSize.height)
+            setOnFrameAvailableListener({ frameAvailable = true }, handler)
+        }
+        surface = Surface(surfaceTexture)
+        reader = ImageReader.newInstance(cpu.width, cpu.height, ImageFormat.YUV_420_888, 3).apply {
+            setOnImageAvailableListener({ r ->
+                val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+                val intr = intrinsics
+                val cb = onCpuFrame
+                if (cb != null && intr != null) cb(img, intr) else img.close()
+            }, handler)
+        }
+        cm.openCamera(id, object : CameraDevice.StateCallback() {
+            override fun onOpened(d: CameraDevice) {
+                device = d
+                openSession(d, fpsRange, 0)
+            }
+            override fun onDisconnected(d: CameraDevice) { d.close(); device = null }
+            override fun onError(d: CameraDevice, e: Int) { error = "Camera error $e"; d.close(); device = null }
+        }, handler)
+    }
+
+    private var sizes: List<Size> = emptyList()
+    /** The picture size the camera actually runs at (for diagnostics). */
+    @Volatile var runningSize: Size? = null; private set
+
+    private fun openSession(d: CameraDevice, fpsRange: Range<Int>, attempt: Int) {
+        val size = sizes.getOrNull(attempt) ?: run { error = "Camera session configuration failed"; return }
+        surfaceTexture?.setDefaultBufferSize(size.width, size.height)
+        imageAspect = size.width.toFloat() / size.height
+        updateCpuMatrix()
+        val targets = listOf(surface!!, reader!!.surface)
+        @Suppress("DEPRECATION")
+        d.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(s: CameraCaptureSession) {
+                session = s
+                runningSize = size
+                Diagnostics.log("Passthrough camera: ${size.width}x${size.height} @ ${fpsRange.upper} fps (video mode)")
+                // video template: steady frame rate and the full video pipeline quality
+                val req = d.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    targets.forEach { addTarget(it) }
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                    set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                    set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                    // the camera's own image clean-up in its quickest form: no frame of delay inside the ISP
+                    set(CaptureRequest.NOISE_REDUCTION_MODE, CameraMetadata.NOISE_REDUCTION_MODE_FAST)
+                    set(CaptureRequest.EDGE_MODE, CameraMetadata.EDGE_MODE_FAST)
+                }
+                s.setRepeatingRequest(req.build(), null, handler)
+            }
+            override fun onConfigureFailed(s: CameraCaptureSession) {
+                Diagnostics.log("Passthrough camera: ${size.width}x${size.height} refused, trying smaller")
+                handler.post { openSession(d, fpsRange, attempt + 1) }
+            }
+        }, handler)
+    }
+
+    /** GL thread: latch the newest camera image. */
+    fun update() {
+        val st = surfaceTexture ?: return
+        if (!frameAvailable) return
+        frameAvailable = false
+        st.updateTexImage()
+        st.getTransformMatrix(stTransform)
+        // The camera's SurfaceTexture transform makes the image upright in the phone's natural
+        // (portrait) orientation. HyperXR runs in landscape, so the quad UV (display, top-left
+        // origin) is first turned into natural-orientation UV, otherwise the image lies sideways.
+        // Devices whose transform has no 90-degree turn already deliver landscape images.
+        val turned = kotlin.math.abs(stTransform[1]) > kotlin.math.abs(stTransform[0])
+        Matrix.setIdentityM(displayToNatural, 0)
+        if (turned) when (displayRotation) {
+            // device top to the left: natural (s, t) = (1 - v, u)
+            Surface.ROTATION_90 -> { displayToNatural[0] = 0f; displayToNatural[1] = 1f; displayToNatural[4] = -1f; displayToNatural[5] = 0f; displayToNatural[12] = 1f; displayToNatural[13] = 0f }
+            // device top to the right: natural (s, t) = (v, 1 - u)
+            Surface.ROTATION_270 -> { displayToNatural[0] = 0f; displayToNatural[1] = -1f; displayToNatural[4] = 1f; displayToNatural[5] = 0f; displayToNatural[12] = 0f; displayToNatural[13] = 1f }
+            Surface.ROTATION_180 -> { displayToNatural[0] = -1f; displayToNatural[5] = -1f; displayToNatural[12] = 1f; displayToNatural[13] = 1f }
+        }
+        // quad UV has a top-left origin; SurfaceTexture expects bottom-left
+        Matrix.multiplyMM(tmpM, 0, FLIP_Y, 0, displayToNatural, 0)
+        Matrix.multiplyMM(texMatrix, 0, stTransform, 0, tmpM, 0)
+        hasFrame = true
+        if (realtimeTimestamps) {
+            Diagnostics.record(Stage.CAMERA_CAPTURE, SystemClock.elapsedRealtimeNanos() - st.timestamp)
+        }
+    }
+
+    fun stop() {
+        try { session?.close() } catch (_: Throwable) {}
+        device?.close(); device = null
+        reader?.close(); reader = null
+        surface?.release(); surface = null
+        surfaceTexture?.release(); surfaceTexture = null
+        hasFrame = false
+    }
+
+    fun shutdown() { stop(); thread.quitSafely() }
+
+    companion object {
+        private val FLIP_Y = floatArrayOf(1f, 0f, 0f, 0f, 0f, -1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 1f, 0f, 1f)
+    }
+}

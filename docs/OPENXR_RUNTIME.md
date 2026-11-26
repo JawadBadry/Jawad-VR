@@ -1,0 +1,101 @@
+# HyperXR Runtime (runtime OpenXR próprio)
+
+O HyperXR inclui um runtime OpenXR próprio, `libhyperxr_openxr.so` (código em
+`native/openxr-runtime/`). Com ele, apps OpenXR para Android (OpenGL ES) rodam num celular dentro
+de um VR Box, com a mesma calibração de IPD, FOV e lente configurada no HyperXR.
+
+## Como funciona
+
+```
+App OpenXR ──► loader Khronos ──► broker (Khronos, se instalado; senão o do HyperXR)
+                                  └► dlopen libhyperxr_openxr.so  (no processo do app)
+                                       ├─ xrNegotiateLoaderRuntimeInterface / xrGetInstanceProcAddr
+                                       ├─ rastreamento 3DoF: game rotation vector + predição pelo giroscópio
+                                       ├─ swapchains: texturas GLES num contexto compartilhado com o do app
+                                       └─ compositor: superfície própria por cima da activity do app,
+                                          lado a lado, pré-distorção da lente, timewarp rotacional
+```
+
+- **Sem IPC**: o runtime roda dentro do processo do app (como o modo "in-process" do Monado). Por
+  isso é escrito sem a libc++ (não depende de `libc++_shared.so`) e exporta só dois símbolos.
+- **Descoberta**: o loader da Khronos pergunta primeiro ao broker instalável
+  (`org.khronos.openxr.runtime_broker`, app *OpenXR Runtime Broker*) e depois ao broker do sistema
+  (`org.khronos.openxr.system_runtime_broker`). Celulares não têm nenhum dos dois, então o HyperXR
+  traz um APK complementar e opcional, **HyperXR OpenXR Broker** (módulo `broker/`), que responde
+  como broker instalável (o primeiro que o loader consulta) apontando para `libhyperxr_openxr.so`
+  do app HyperXR. Ele é separado porque o Android recusa instalar um APK cujo provider já existe
+  no aparelho ("conflito com pacote existente"); alguns celulares já declaram o broker do sistema,
+  por isso o complementar usa o instalável. Ele só conflita com o app *OpenXR Runtime Broker* da
+  Khronos: com esse instalado, escolha "HyperXR Runtime" nele. Configurações > Runtime mostra qual
+  pacote ocupa cada broker (o HyperXR se anuncia pelo serviço `org.khronos.openxr.OpenXRRuntimeService`).
+- **Controles**: no OpenXR os controles pertencem ao runtime. A janela do runtime registra as teclas
+  e eixos de gamepad/Joy-Con e o toque na tela (o botão do VR Box) e os entrega às ações do app pelos
+  perfis `oculus/touch_controller` ou `khr/simple_controller`, o que o app tiver
+  sugerido. Em activities comuns (Unity, GameActivity) o callback da janela é embrulhado e o app
+  continua recebendo os eventos; numa NativeActivity a janela do runtime recebe foco e toques.
+  As poses de mira/empunhadura acompanham a cabeça (mira pelo olhar), sem rastreamento de controle.
+- **Calibração**: o runtime lê IPD, FOV e coeficientes da lente do provider
+  `content://com.hyperxr.runtime/viewer` (só esses números). Se o app não enxergar o HyperXR, usa
+  valores padrão.
+- **Compositor**: no `xrEndFrame`, o runtime espera (na GPU) pelos fences das imagens liberadas e
+  desenha os dois olhos. Para cada pixel ele calcula a direção na lente (k1, k2), corrige pela
+  rotação da cabeça desde que o app renderizou (timewarp) e reprojeta no frustum do app. A
+  superfície fica numa janela própria que não recebe foco nem toques, então o app continua
+  recebendo a entrada.
+
+## O que é suportado
+
+| Área | Suporte |
+|---|---|
+| API | OpenXR 1.0 e 1.1 (`xrLocateSpaces`, LOCAL_FLOOR) |
+| Extensões | `XR_KHR_android_create_instance`, `XR_KHR_opengl_es_enable`, `XR_KHR_convert_timespec_time`, `XR_MND_headless`, `XR_EXT_local_floor`, `XR_KHR_android_thread_settings`, `XR_EXT_performance_settings` |
+| Mãos como controle | `XR_EXT_hand_interaction` (pinça, ativar mira, agarrar, e as poses mira/empunhadura/pinça/toque das mãos rastreadas), junto com o perfil de controle |
+| Mãos | `XR_EXT_hand_tracking` (26 juntas, com raio), com as mãos que o HyperMagic rastreia pela câmera (veja abaixo) |
+| Sistema | HMD, estéreo primário, blend OPAQUE e ALPHA_BLEND (a câmera do celular atrás do jogo), orientação rastreada (3DoF), posição por modelo de pescoço |
+| Espaços | VIEW, LOCAL (altura dos olhos), STAGE e LOCAL_FLOOR (chão em y = 0), espaços de ação |
+| Swapchains | `GL_SRGB8_ALPHA8`, `GL_RGBA8`, profundidade 16/24/24+8/32F, texturas array, imagem estática |
+| Camadas | projeção (com timewarp), quad, cilindro (`XR_KHR_composition_layer_cylinder`) e equirect (`XR_KHR_composition_layer_equirect2`, 180/360, raio finito ou infinito); `eyeVisibility` por olho; até 16 camadas |
+| Ciclo de quadros | wait/begin/end com ritmo da tela, `XR_FRAME_DISCARDED`, estados da sessão completos |
+| Ações | perfis `oculus/touch_controller`, `khr/simple_controller` e mãos (`hand_interaction_ext`); gatilho, aperto, analógicos, A/B/X/Y, menu; poses de mira/empunhadura; fontes ligadas; vibração no controle daquela mão |
+
+## Limitações (reais)
+
+- **Controles sem rastreamento**: botões, gatilhos e analógicos funcionam; a pose do controle segue a
+  cabeça.
+- **Mãos**: chegam pelo `XR_EXT_hand_tracking`. Ao abrir um jogo OpenXR, o HyperMagic inicia um serviço
+  em primeiro plano (`HandBridgeService`, notificação "mãos no jogo") que liga a câmera traseira só
+  enquanto o jogo tem um rastreador de mão e publica as mãos ~90 vezes por segundo num arquivo
+  compartilhado (`hx_hands.h`), que o runtime mapeia pelo provider (`content://com.hypermagic.runtime/hands`).
+  Os 21 pontos viram as 26 juntas do OpenXR (palma e metacarpos estimados ao longo da palma; cada
+  junta orientada pelo osso e pelo dorso da mão); a câmera é tratada como 8 cm à frente dos olhos.
+  Sem velocidades das juntas; a orientação do polegar é aproximada. Desligue em Ajustes > Mãos ("Mãos nos jogos OpenXR").
+- **Passthrough**: o serviço de mãos do HyperMagic também manda quadros RGBA de até 640x480 a ~30 fps
+  (`hx_camera.h`, `content://com.hypermagic.runtime/camera`) enquanto o jogo usa o modo `ALPHA_BLEND`; só o jogo
+  que o HyperMagic abriu (e o próprio HyperMagic) pode abrir esses arquivos. A imagem é tratada como
+  infinitamente longe (só rotação, sem profundidade: objetos perto ficam deslocados), é a mesma nos
+  dois olhos, fica sempre atrás de todas as camadas e tem bordas pretas onde a câmera não alcança o
+  campo de visão. A cor da borda não existe.
+- **Jogos de Quest e Pico**: não são suportados. O runtime não tem as extensões da Meta (`XR_FB_*`,
+  `XR_META_*`, `XR_OCULUS_*`) nem as da Pico (`XR_BD_*`), e o importador recusa APKs feitos para esses
+  óculos (loader, SDK ou loja do fabricante). Jogos OpenXR para Android com o loader da Khronos rodam.
+- **Sem Vulkan**: apps só-Vulkan não rodam (jogos Godot 4 em Vulkan são trocados para o renderizador
+  Compatibilidade ao corrigir o APK).
+- **Sem 6DoF**: a posição vem de um modelo de pescoço.
+- **Sem cubo**: camadas de cubo e o equirect antigo (v1) são recusados com `XR_ERROR_LAYER_INVALID`.
+  Cilindro e equirect2 são desenhados por raio a partir do olho (sem mipmaps: texturas grandes vistas
+  de longe podem serrilhar). A camada de projeção é sempre desenhada primeiro, antes das outras.
+- **Conformidade**: o runtime não passou pela suíte oficial de conformidade (CTS) da Khronos.
+
+## Testes
+
+- `native/openxr-runtime/tests/run_host_tests.sh`: compila o runtime para Linux (camada de
+  plataforma headless) e executa 412 verificações com AddressSanitizer e UBSan. Os testes passam
+  pela mesma negociação que o loader usa e cobrem instância, extensões, caminhos, sistema, estados
+  da sessão, ordem do ciclo de quadros, espaços, visões (IPD), perda de rastreamento, ações e entrada
+  (gamepad/toque chegando às ações, mudanças entre syncs, pose de mira), mãos (juntas no espaço certo,
+  eixos do OpenXR, mãos velhas descartadas, mão esquerda espelhada), mãos como controle e vibração, e
+  camadas (geometria do cilindro e do equirect, validação).
+- Teste no aparelho: Configurações > Runtime > *Testar o runtime HyperXR no visor*. Ele carrega o
+  runtime como o loader faz, abre uma sessão GLES real por 15 s e mostra um relatório com os estados
+  da sessão, o número de quadros e o intervalo médio entre eles. Durante o teste aparecem marcadores
+  coloridos fixos no espaço e uma grade no chão.
